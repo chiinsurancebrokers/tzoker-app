@@ -33,6 +33,8 @@ from tzoker_core import (
     load_all_draws,
     min_guaranteed_matches_table,
 )
+from tzoker_llm import TICKET_PRICE_EUR, ask_claude_for_pick, build_analysis_payload, get_api_key
+from tzoker_openai import get_openai_api_key, review_pick_with_chatgpt
 
 st.set_page_config(page_title="Tzoker Analysis", page_icon="🎰", layout="wide")
 
@@ -181,18 +183,124 @@ def page_predictions(df, analyzer):
     st.write("Joker number(s):", ", ".join(str(j) for j in system_jokers))
 
     combos, total_tickets = build_full_system(system_numbers, system_jokers)
-    cost_per_ticket = 0.5  # €0.50/line, standard Tzoker price
     st.metric("Total lines in this system", f"{total_tickets:,}")
-    st.metric("Estimated cost", f"€{total_tickets * cost_per_ticket:,.2f}")
+    st.metric("Estimated cost", f"€{total_tickets * TICKET_PRICE_EUR:,.2f}")
 
     guarantee = min_guaranteed_matches_table(n_extra)
     if guarantee:
         st.write("**Guaranteed tickets matching category \"5\" if k of your numbers are drawn:**")
         st.dataframe(pd.DataFrame(guarantee), hide_index=True, width='stretch')
+    st.caption(
+        "This is a *full* system (every 5-number combination inside your chosen numbers), "
+        "computed directly rather than reproduced from Allwyn's table. Allwyn also sells "
+        "cheaper *reduced* systems that trade a 100% category-5 guarantee for lower cost — "
+        "see the official guide: "
+        "https://www.allwyn.gr/el/odigos/systimata-tzoker"
+    )
 
     st.subheader("③ Full jackpot pick (5+1) — long shot, shown for completeness")
     st.write(f"Core 5 + top Joker ({ranked_jokers[0]}) — 1 in 24,435,180.")
     number_badges(core5, joker=ranked_jokers[0])
+
+
+def page_ai_insights(analyzer):
+    st.header("🤖 AI Insights (Claude + ChatGPT second opinion)")
+    st.info(
+        "Neither model predicts draws — each one is still an independent random event. "
+        "Claude reads the same statistical scores shown in the Predictions tab and "
+        "synthesizes a pick from within them (it can't invent its own numbers). "
+        "ChatGPT then reviews that pick against the same data — checking its arithmetic "
+        "and whether its wording overstates what a frequency score means — rather than "
+        "proposing a competing pick of its own. Two models agreeing isn't stronger "
+        "evidence a combination will win; it's just two reviews of the same numbers.",
+        icon="ℹ️",
+    )
+
+    claude_key = get_api_key()
+    if not claude_key:
+        st.warning(
+            "No Anthropic API key found. Set the `ANTHROPIC_API_KEY` environment variable "
+            "(on Railway: Project → Variables), or paste one below for this session only "
+            "(it is not saved anywhere).",
+            icon="🔑",
+        )
+        pasted = st.text_input("Anthropic API key", type="password", key="_key_input_field")
+        if pasted:
+            st.session_state["_anthropic_key_input"] = pasted
+            st.rerun()
+        return
+
+    c1, c2 = st.columns(2)
+    with c1:
+        target_category = st.selectbox("Target category", ["5", "4+1", "5+1"])
+    with c2:
+        budget_eur = st.number_input("Budget (€)", min_value=1.0, max_value=1000.0, value=10.0, step=1.0)
+
+    if st.button("Ask Claude"):
+        with st.spinner("Analyzing historical scores..."):
+            result, error = ask_claude_for_pick(analyzer, target_category, budget_eur, claude_key)
+        if error:
+            st.error(error)
+            st.session_state.pop("_claude_result", None)
+        else:
+            st.session_state["_claude_result"] = result
+            st.session_state["_claude_payload"] = build_analysis_payload(
+                analyzer, target_category, budget_eur
+            )
+            st.session_state.pop("_chatgpt_review", None)
+
+    result = st.session_state.get("_claude_result")
+    if not result:
+        return
+
+    st.subheader("Claude's recommended pick")
+    number_badges(result["numbers"], joker=result["joker_numbers"][0]
+                  if len(result["joker_numbers"]) == 1 else None)
+    if len(result["joker_numbers"]) > 1:
+        st.write("Joker numbers:", ", ".join(str(j) for j in result["joker_numbers"]))
+
+    st.metric("System size", result.get("system_size", len(result["numbers"])))
+    st.metric("Estimated cost", f"€{result.get('estimated_cost_eur', 0):,.2f}")
+
+    st.write("**Pattern notes:**", result.get("pattern_notes", ""))
+    st.write("**Rationale:**", result.get("rationale", ""))
+    st.caption(result.get("caveat", ""))
+
+    st.divider()
+    st.subheader("Second opinion (ChatGPT)")
+
+    openai_key = get_openai_api_key()
+    if not openai_key:
+        st.warning(
+            "No OpenAI API key found. Set the `OPENAI_API_KEY` environment variable "
+            "(on Railway: Project → Variables), or paste one below for this session only "
+            "(it is not saved anywhere).",
+            icon="🔑",
+        )
+        pasted_oa = st.text_input("OpenAI API key", type="password", key="_oa_key_input_field")
+        if pasted_oa:
+            st.session_state["_openai_key_input"] = pasted_oa
+            st.rerun()
+        return
+
+    if st.button("Get ChatGPT's review"):
+        with st.spinner("Checking Claude's pick..."):
+            review, rev_error = review_pick_with_chatgpt(
+                st.session_state["_claude_payload"], result, openai_key
+            )
+        if rev_error:
+            st.error(rev_error)
+        else:
+            st.session_state["_chatgpt_review"] = review
+
+    review = st.session_state.get("_chatgpt_review")
+    if review:
+        verdict = review.get("verdict", "unknown")
+        if verdict == "pass":
+            st.success(f"ChatGPT verdict: **pass** — {review.get('summary', '')}")
+        else:
+            st.warning(f"ChatGPT verdict: **{verdict}** — {review.get('summary', '')}")
+        st.dataframe(pd.DataFrame(review.get("checks", [])), hide_index=True, width='stretch')
 
 
 def page_backtest(analyzer):
@@ -278,13 +386,15 @@ def main():
     st.sidebar.title("🎰 Tzoker Analysis")
     page = st.sidebar.radio(
         "Section",
-        ["Dashboard", "Predictions", "Backtest", "My Submissions"],
+        ["Dashboard", "Predictions", "AI Insights", "Backtest", "My Submissions"],
     )
 
     if page == "Dashboard":
         page_dashboard(df, report, analyzer)
     elif page == "Predictions":
         page_predictions(df, analyzer)
+    elif page == "AI Insights":
+        page_ai_insights(analyzer)
     elif page == "Backtest":
         page_backtest(analyzer)
     elif page == "My Submissions":
