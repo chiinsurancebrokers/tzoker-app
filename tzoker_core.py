@@ -162,7 +162,7 @@ def _load_year_file(filepath: str, year: str):
     return draws, errors
 
 
-def load_all_draws(data_dir: str = ".", start_year: int = 1997, end_year: int = 2025):
+def load_all_draws(data_dir: str = ".", start_year: int = 1997, end_year: int = 2026):
     """Load and clean every Joker_<year>.xlsx file found in data_dir."""
     all_draws = []
     load_report = []
