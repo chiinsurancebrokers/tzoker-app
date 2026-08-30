@@ -232,6 +232,91 @@ class JokerAnalyzer:
         )[:top_n]
         return hot, cold
 
+    def overdue_jokers(self, top_n=5):
+        """Joker numbers ranked by draws since their last appearance."""
+        last_seen = {}
+        for idx, j in enumerate(self.all_draws["joker"]):
+            last_seen[j] = idx
+        total = len(self.all_draws)
+        gaps = {j: total - 1 - last_seen.get(j, -1) for j in range(1, 21)}
+        return sorted(gaps.items(), key=lambda x: -x[1])[:top_n]
+
+    def distribution_stats(self, last_n_draws=None):
+        """
+        Descriptive distribution stats matching the categories Allwyn/community
+        Tzoker stats pages publish: odd/even split, low/high split, sum of the
+        5 numbers, spread (max-min), frequency by decade (1-10, 11-20, ...),
+        and frequency by last digit (0-9). All purely descriptive of draws
+        that already happened.
+        """
+        df = self.all_draws.tail(last_n_draws) if last_n_draws else self.all_draws
+        sums = df["main_numbers"].apply(sum)
+        spreads = df["main_numbers"].apply(lambda nums: max(nums) - min(nums))
+        odd_counts = df["main_numbers"].apply(lambda nums: sum(1 for n in nums if n % 2 == 1))
+        low_counts = df["main_numbers"].apply(lambda nums: sum(1 for n in nums if n <= 23))
+
+        decade_freq = Counter()
+        last_digit_freq = Counter()
+        for nums in df["main_numbers"]:
+            for n in nums:
+                decade_label = f"{((n - 1) // 10) * 10 + 1}-{min(((n - 1) // 10) * 10 + 10, 45)}"
+                decade_freq[decade_label] += 1
+                last_digit_freq[n % 10] += 1
+
+        return {
+            "draws_analyzed": len(df),
+            "sum_of_5_numbers": {
+                "mean": round(sums.mean(), 1), "std": round(sums.std(), 1),
+                "min": int(sums.min()), "max": int(sums.max()),
+            },
+            "spread_max_minus_min": {
+                "mean": round(spreads.mean(), 1), "std": round(spreads.std(), 1),
+            },
+            "odd_count_distribution": dict(Counter(odd_counts).most_common()),
+            "low_count_distribution_le23": dict(Counter(low_counts).most_common()),
+            "frequency_by_decade": dict(sorted(decade_freq.items())),
+            "frequency_by_last_digit": dict(sorted(last_digit_freq.items())),
+        }
+
+    def number_evidence(self, numbers, recent_window=150):
+        """
+        Ground truth per-number statistics, computed independently of anything an
+        LLM claims. Used to attach real evidence to a pick after the fact rather
+        than trusting a model to accurately restate figures from memory.
+        """
+        total = len(self.all_draws)
+        recent_df = self.all_draws.tail(recent_window)
+        recent_c = Counter()
+        for nums in recent_df["main_numbers"]:
+            recent_c.update(nums)
+        gaps = dict(self.overdue_numbers(top_n=45))
+
+        rows = []
+        for n in numbers:
+            rows.append({
+                "number": n,
+                "overall_count": self.main_freq.get(n, 0),
+                "overall_pct": round(100 * self.main_freq.get(n, 0) / total, 2) if total else 0,
+                "recent_count": recent_c.get(n, 0),
+                "recent_window_draws": len(recent_df),
+                "draws_since_last_seen": gaps.get(n, None),
+                "decade": f"{((n - 1) // 10) * 10 + 1}-{min(((n - 1) // 10) * 10 + 10, 45)}",
+            })
+        return rows
+
+    def joker_evidence(self, jokers):
+        total = len(self.all_draws)
+        gaps = dict(self.overdue_jokers(top_n=20))
+        rows = []
+        for j in jokers:
+            rows.append({
+                "joker": j,
+                "overall_count": self.joker_freq.get(j, 0),
+                "overall_pct": round(100 * self.joker_freq.get(j, 0) / total, 2) if total else 0,
+                "draws_since_last_seen": gaps.get(j, None),
+            })
+        return rows
+
     def pattern_stats(self, last_n_draws=200):
         """Sum range / odd-even / low-high distribution over recent draws, for scoring."""
         df = self.all_draws.tail(last_n_draws)
