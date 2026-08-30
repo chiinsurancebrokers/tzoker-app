@@ -73,6 +73,12 @@ def build_analysis_payload(analyzer, target_category, budget_eur):
             str(analyzer.all_draws["date"].max().date()),
         ],
         "target_category": target_category,
+        # Only "5" and "5+1" have a prize that gets split among multiple winners
+        # (5+1 is a variable jackpot; "5" is capped at EUR 2M total if >20 winners).
+        # "4+1" and every other category is a FIXED payout regardless of how many
+        # other people also win it - pot-splitting doesn't apply there at all.
+        # Computed in Python, not left to the model to recall correctly.
+        "prize_is_shared_for_this_category": target_category in ("5", "5+1"),
         "budget_eur": budget_eur,
         "ticket_price_eur": TICKET_PRICE_EUR,
         "system_cost_table": system_cost_table(),
@@ -95,7 +101,12 @@ def build_analysis_payload(analyzer, target_category, budget_eur):
 SYSTEM_PROMPT = """You are a statistics-literate assistant helping organize a Greek Tzoker \
 (Τζόκερ) lottery play. You will be given: precomputed statistical scores, ground-truth \
 per-number evidence (real counts/percentages/gaps), distribution stats, a system-cost \
-table, a target_category, and a budget_eur.
+table, a target_category, prize_is_shared_for_this_category, and a budget_eur.
+
+Your overall aim is a CONSISTENT, BUDGET-BOUNDED method applied the same way every time -
+not chasing losses, not escalating stakes, not implying wins will exceed losses over time.
+No selection method changes the fact that this is a negative-expected-value game; never
+suggest otherwise, even implicitly, in pattern_notes or rationale.
 
 Hard constraints, non-negotiable:
 - Every Tzoker combination of 5 numbers from 45 is EXACTLY as likely to be drawn as any \
@@ -119,6 +130,16 @@ in Python after you respond, so get them as close as you can, but do not worry i
 the numbers/joker_numbers you choose are what matters most.)
 - If budget_eur is below the cheapest row in system_cost_table (a plain 5-number system), \
 still return that cheapest 5-number system and say so plainly in rationale.
+- Pot-splitting tiebreak - ONLY apply this when prize_is_shared_for_this_category is \
+true (categories "5" and "5+1"): among candidate numbers with similar scores, you may \
+prefer numbers in the 32-45 range over 1-31 as a tiebreaker. Numbers 1-31 double as \
+calendar dates and get picked disproportionately by other players via birthdates, so \
+32-45 numbers reduce the chance of SPLITTING the prize with other winners if you win. \
+This does NOT change your odds of winning - only what you'd receive if you do. If you \
+use this reasoning, say so explicitly and label it as being about payout-if-you-win, not \
+win probability. When prize_is_shared_for_this_category is false (e.g. "4+1", which pays \
+a fixed EUR 2,500 regardless of how many others also win it), do NOT mention pot-splitting \
+at all - it has no relevance and citing it would misstate how that category's prize works.
 - target_category changes what you should optimize for:
     - "5": maximize system_size within budget (more numbers = more 5-number \
       sub-combinations = more chances at matching all 5). Use exactly 1 joker number - \
@@ -143,6 +164,139 @@ Respond with ONLY a JSON object (no markdown fences, no preamble), matching exac
 """
 
 
+def _parse_claude_json(raw_text):
+    """Strip markdown fences if present and parse JSON. Returns (dict, error)."""
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:]
+    try:
+        return json.loads(cleaned), None
+    except json.JSONDecodeError:
+        return None, f"Couldn't parse Claude's response as JSON:\n\n{raw_text}"
+
+
+def _validate_and_correct(result, raw_text, payload, analyzer, target_category, budget_eur):
+    """
+    Shared validation/correction pipeline used for both the initial pick and every
+    chat-driven revision - every turn gets the exact same deterministic guarantees,
+    not just the first one.
+    """
+    valid_numbers = {row["number"] for row in payload["top_15_scored_numbers"]}
+    valid_jokers = {row["joker"] for row in payload["top_5_scored_jokers"]}
+    numbers = [n for n in result.get("numbers", []) if n in valid_numbers]
+    jokers = [j for j in result.get("joker_numbers", []) if j in valid_jokers]
+
+    if len(numbers) < 5 or not jokers:
+        return None, (
+            "Claude's response didn't include enough valid numbers/jokers from the "
+            f"provided list. Raw response:\n\n{raw_text}"
+        )
+
+    numbers = sorted(set(numbers))
+    jokers = sorted(set(jokers))
+    result["numbers"] = numbers
+    result["joker_numbers"] = jokers
+
+    result["evidence_numbers"] = analyzer.number_evidence(numbers)
+    result["evidence_jokers"] = analyzer.joker_evidence(jokers)
+
+    exact_combos = comb(len(numbers), 5)
+    exact_cost = round(exact_combos * len(jokers) * TICKET_PRICE_EUR, 2)
+    result["system_size"] = len(numbers)
+    result["estimated_cost_eur"] = exact_cost
+    result["over_budget"] = exact_cost > budget_eur
+
+    if target_category == "5+1":
+        odds = _ODDS_BY_CATEGORY.get("5+1")
+        result["caveat"] = (
+            (result.get("caveat", "") or "").rstrip(". ") + ". "
+            f"5+1 is the jackpot long shot: 1 in {odds:,} — far lower odds than "
+            f"category \"5\" (1 in {_ODDS_BY_CATEGORY['5']:,}) or \"4+1\" "
+            f"(1 in {_ODDS_BY_CATEGORY['4+1']:,})."
+        ).strip()
+
+    return result, None
+
+
+CHAT_SYSTEM_PROMPT = SYSTEM_PROMPT + """
+
+You are now in a follow-up conversation about the pick you already made. The user may
+ask questions, or ask you to reconsider the pick - including based on a "cross_check"
+field you may be given, showing how the currently-picked numbers rank (1=hottest of 45)
+over other time windows (last 100 draws, last 1000, all-time) than the one you originally
+scored against. This is still purely descriptive of the past, same as everything else -
+a number ranking well in one window and poorly in another is not evidence either way
+about the next draw, and you must not imply otherwise.
+
+If the user asks you to reconsider, you may swap in a different number FROM
+top_15_scored_numbers (never outside it), and should explain the swap in terms of the
+historical pattern it reflects (e.g. "swapped 3 for 41: 3 ranks 37th all-time despite a
+recent spike, while 41 ranks 7th all-time and 3rd recently"), not in terms of future
+odds. If the user is just asking a question and not requesting a change, keep the
+existing numbers/jokers exactly as they are.
+
+Always respond with ONLY a JSON object (no markdown fences, no preamble), matching
+exactly - always include the full pick even if unchanged:
+{
+  "reply": "conversational answer to the user's message, 1-4 sentences",
+  "numbers_changed": true or false,
+  "numbers": [current or revised list of ints from top_15_scored_numbers],
+  "joker_numbers": [current or revised list of ints from top_5_scored_jokers],
+  "system_size": int,
+  "estimated_cost_eur": number,
+  "pattern_notes": "as before",
+  "rationale": "as before",
+  "caveat": "as before"
+}
+"""
+
+
+def ask_claude_chat(analyzer, payload, api_history, user_message, target_category, budget_eur,
+                     api_key, cross_check=None, model=MODEL):
+    """
+    One turn of follow-up conversation about an existing pick. api_history is the list
+    of prior {"role": ..., "content": ...} messages (Anthropic format) from this
+    conversation so far - the caller owns and persists this across turns. Returns
+    (result, updated_api_history, error).
+    """
+    try:
+        import anthropic
+    except ImportError:
+        return None, api_history, "The 'anthropic' package isn't installed. Add it to requirements.txt."
+
+    user_payload = {"user_message": user_message}
+    if cross_check is not None:
+        user_payload["cross_check"] = cross_check
+    new_messages = api_history + [{"role": "user", "content": json.dumps(user_payload)}]
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=model,
+            max_tokens=800,
+            system=CHAT_SYSTEM_PROMPT,
+            messages=new_messages,
+        )
+        raw_text = "".join(
+            block.text for block in response.content if getattr(block, "type", None) == "text"
+        )
+    except Exception as e:
+        return None, api_history, f"Claude API call failed: {e}"
+
+    result, error = _parse_claude_json(raw_text)
+    if error:
+        return None, api_history, error
+
+    result, error = _validate_and_correct(result, raw_text, payload, analyzer, target_category, budget_eur)
+    if error:
+        return None, api_history, error
+
+    updated_history = new_messages + [{"role": "assistant", "content": raw_text}]
+    return result, updated_history, None
+
+
 def ask_claude_for_pick(analyzer, target_category, budget_eur, api_key, model=MODEL):
     try:
         import anthropic
@@ -165,57 +319,12 @@ def ask_claude_for_pick(analyzer, target_category, budget_eur, api_key, model=MO
     except Exception as e:
         return None, f"Claude API call failed: {e}"
 
-    cleaned = raw_text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.startswith("json"):
-            cleaned = cleaned[4:]
-    try:
-        result = json.loads(cleaned)
-    except json.JSONDecodeError:
-        return None, f"Couldn't parse Claude's response as JSON:\n\n{raw_text}"
+    result, error = _parse_claude_json(raw_text)
+    if error:
+        return None, error
 
-    valid_numbers = {row["number"] for row in payload["top_15_scored_numbers"]}
-    valid_jokers = {row["joker"] for row in payload["top_5_scored_jokers"]}
-    numbers = [n for n in result.get("numbers", []) if n in valid_numbers]
-    jokers = [j for j in result.get("joker_numbers", []) if j in valid_jokers]
-
-    if len(numbers) < 5 or not jokers:
-        return None, (
-            "Claude's response didn't include enough valid numbers/jokers from the "
-            f"provided list. Raw response:\n\n{raw_text}"
-        )
-
-    numbers = sorted(set(numbers))
-    jokers = sorted(set(jokers))
-    result["numbers"] = numbers
-    result["joker_numbers"] = jokers
-
-    # Attach the real evidence for exactly the numbers/jokers Claude actually chose,
-    # computed independently in Python - this is what a reviewer (or the user) checks
-    # Claude's prose against, rather than trusting Claude to have restated the figures
-    # from the payload accurately.
-    result["evidence_numbers"] = analyzer.number_evidence(numbers)
-    result["evidence_jokers"] = analyzer.joker_evidence(jokers)
-
-    # Don't trust the model's own arithmetic for these two fields - recompute them
-    # deterministically from what it actually returned, exactly as build_full_system
-    # would. This is the same math tzoker_core.build_full_system uses; duplicated
-    # here (rather than imported) to avoid a circular import with tzoker_core.
-    exact_combos = comb(len(numbers), 5)
-    exact_cost = round(exact_combos * len(jokers) * TICKET_PRICE_EUR, 2)
-    result["system_size"] = len(numbers)
-    result["estimated_cost_eur"] = exact_cost
-    result["over_budget"] = exact_cost > budget_eur
-
-    # Don't rely on the model to remember the long-shot framing - enforce it.
-    if target_category == "5+1":
-        odds = _ODDS_BY_CATEGORY.get("5+1")
-        result["caveat"] = (
-            (result.get("caveat", "") or "").rstrip(". ") + ". "
-            f"5+1 is the jackpot long shot: 1 in {odds:,} — far lower odds than "
-            f"category \"5\" (1 in {_ODDS_BY_CATEGORY['5']:,}) or \"4+1\" "
-            f"(1 in {_ODDS_BY_CATEGORY['4+1']:,})."
-        ).strip()
+    result, error = _validate_and_correct(result, raw_text, payload, analyzer, target_category, budget_eur)
+    if error:
+        return None, error
 
     return result, None
