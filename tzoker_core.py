@@ -224,6 +224,33 @@ class JokerAnalyzer:
         gaps = {n: total - 1 - last_seen.get(n, -1) for n in range(1, 46)}
         return sorted(gaps.items(), key=lambda x: -x[1])[:top_n]
 
+    def multi_window_stats(self, numbers, windows=(100, 1000, None)):
+        """
+        For the given numbers, their count and hot/cold rank (1=hottest of 45)
+        across several time windows - lets you cross-check a pick (e.g. from
+        AI Insights, which scores off one fixed recent window) against what
+        the Statistics tab shows over other horizons: does a number that
+        looked strong in a narrow window still hold up over the last 1000
+        draws, or all-time, or was it a blip in a small sample?
+        """
+        results = {n: {} for n in numbers}
+        for w in windows:
+            label = "all_time" if w is None else f"last_{w}"
+            df = self.all_draws.tail(w) if w else self.all_draws
+            c = Counter()
+            for nums in df["main_numbers"]:
+                c.update(nums)
+            full_counts = {i: c.get(i, 0) for i in range(1, 46)}
+            ranked = sorted(full_counts, key=full_counts.get, reverse=True)
+            rank_map = {num: i + 1 for i, num in enumerate(ranked)}
+            for n in numbers:
+                results[n][label] = {
+                    "count": full_counts.get(n, 0),
+                    "rank_of_45": rank_map.get(n),
+                    "draws_in_window": len(df),
+                }
+        return results
+
     def joker_hot_cold(self, top_n=5):
         hot = self.joker_freq.most_common(top_n)
         cold = sorted(
