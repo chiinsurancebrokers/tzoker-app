@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+submissions_data.json
+submissions_data_backup_*.json
+.streamlit/
+.idea/
