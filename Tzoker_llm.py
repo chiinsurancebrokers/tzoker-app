@@ -25,8 +25,11 @@ from math import comb
 
 import streamlit as st
 
+from tzoker_core import PRIZE_CATEGORIES
+
 MODEL = "claude-sonnet-5"
 TICKET_PRICE_EUR = 1.00  # confirmed current Allwyn price per line, Aug 2026
+_ODDS_BY_CATEGORY = {c["key"]: c["odds_1_in"] for c in PRIZE_CATEGORIES}
 
 
 def get_api_key():
@@ -60,6 +63,9 @@ def build_analysis_payload(analyzer, target_category, budget_eur):
     jscores = analyzer.score_jokers()
     ranked_jokers = sorted(jscores, key=jscores.get, reverse=True)
 
+    top15 = ranked[:15]
+    top5j = ranked_jokers[:5]
+
     return {
         "total_draws_in_history": len(analyzer.all_draws),
         "date_range": [
@@ -71,34 +77,58 @@ def build_analysis_payload(analyzer, target_category, budget_eur):
         "ticket_price_eur": TICKET_PRICE_EUR,
         "system_cost_table": system_cost_table(),
         "top_15_scored_numbers": [
-            {"number": n, "score": round(scores[n], 4)} for n in ranked[:15]
+            {"number": n, "score": round(scores[n], 4)} for n in top15
         ],
         "top_5_scored_jokers": [
-            {"joker": j, "score": round(jscores[j], 4)} for j in ranked_jokers[:5]
+            {"joker": j, "score": round(jscores[j], 4)} for j in top5j
         ],
-        "pattern_stats_last_200_draws": {
-            k: (round(v, 2) if v is not None else None)
-            for k, v in analyzer.pattern_stats(last_n_draws=200).items()
-        },
+        # Ground-truth per-number evidence for every candidate Claude is allowed to
+        # choose from - the exact real counts/percentages/gaps, computed the same
+        # way regardless of what Claude says about them, so its prose can be
+        # checked against real numbers rather than trusted at face value.
+        "evidence_for_candidate_numbers": analyzer.number_evidence(top15),
+        "evidence_for_candidate_jokers": analyzer.joker_evidence(top5j),
+        "distribution_stats_last_200_draws": analyzer.distribution_stats(last_n_draws=200),
     }
 
 
 SYSTEM_PROMPT = """You are a statistics-literate assistant helping organize a Greek Tzoker \
-(Τζόκερ) lottery play. You will be given precomputed statistical scores over the real \
-historical draw data, and a pre-built system-cost table.
+(Τζόκερ) lottery play. You will be given: precomputed statistical scores, ground-truth \
+per-number evidence (real counts/percentages/gaps), distribution stats, a system-cost \
+table, a target_category, and a budget_eur.
 
 Hard constraints, non-negotiable:
-- Tzoker draws are independent random events. Nothing in past draws changes the odds of \
-the next one. You must never claim or imply the numbers you pick are more likely to be \
-drawn next.
+- Every Tzoker combination of 5 numbers from 45 is EXACTLY as likely to be drawn as any \
+other - this is mathematically true regardless of any historical frequency. You must \
+NEVER state or imply that a number or combination has "bigger odds", "better chances", \
+is "more likely to win", or anything equivalent, for a FUTURE draw. The only valid odds \
+figures are the fixed category odds (e.g. "5" is 1 in 1,221,759) - those don't change \
+based on which numbers you pick.
+- What you ARE allowed to say: a number "appeared more often historically" or "scores \
+higher on the frequency/recency/overdue formula" - purely descriptive of the past, never \
+predictive of the future. Every such claim must cite the specific value it's based on \
+from evidence_for_candidate_numbers / evidence_for_candidate_jokers (e.g. "27 appeared \
+in 11.4% of all draws, above the ~11.1% expected by chance" - not just "27 is hot").
 - Do NOT invent numbers or statistics. Choose the numbers you recommend FROM the \
 top_15_scored_numbers and top_5_scored_jokers lists you are given - do not substitute \
 numbers that aren't in those lists.
 - Do NOT do your own combinatorics. Pick the system size from the given \
-system_cost_table rows whose cost fits within budget_eur; do not compute your own cost.
-- Your job is to (a) briefly describe what the provided scores show in plain language, \
-and (b) synthesize a concrete pick + system size that fits the stated budget and target \
-category, then (c) restate the independence caveat.
+system_cost_table rows whose cost fits within budget_eur; do not compute your own cost. \
+(Your system_size and estimated_cost_eur will be independently recomputed and corrected \
+in Python after you respond, so get them as close as you can, but do not worry if exact -
+the numbers/joker_numbers you choose are what matters most.)
+- If budget_eur is below the cheapest row in system_cost_table (a plain 5-number system), \
+still return that cheapest 5-number system and say so plainly in rationale.
+- target_category changes what you should optimize for:
+    - "5": maximize system_size within budget (more numbers = more 5-number \
+      sub-combinations = more chances at matching all 5). Use exactly 1 joker number - \
+      extra joker coverage does not help this category.
+    - "4+1": both the 5-number sub-combination AND the joker must be right, so balance \
+      system_size against covering 2-3 joker numbers from top_5_scored_jokers, within \
+      budget.
+    - "5+1": explicitly state in rationale that this is the jackpot long-shot category \
+      (odds 1 in 24,435,180 vs 1 in 1,221,759 for "5" and 1 in 122,176 for "4+1"), and \
+      keep the system modest rather than spending the whole budget chasing it.
 
 Respond with ONLY a JSON object (no markdown fences, no preamble), matching exactly:
 {
@@ -106,7 +136,7 @@ Respond with ONLY a JSON object (no markdown fences, no preamble), matching exac
   "joker_numbers": [list of 1-3 ints, drawn only from top_5_scored_jokers],
   "system_size": int,
   "estimated_cost_eur": number,
-  "pattern_notes": "1-3 sentences describing the observed historical scores/frequency pattern",
+  "pattern_notes": "1-3 sentences, each citing a specific value from the evidence fields, describing the observed historical pattern - never framed as future likelihood",
   "rationale": "1-3 sentences on why this system size fits the target category and budget",
   "caveat": "1 sentence restating that draws are independent and this doesn't predict the future"
 }
@@ -156,6 +186,36 @@ def ask_claude_for_pick(analyzer, target_category, budget_eur, api_key, model=MO
             f"provided list. Raw response:\n\n{raw_text}"
         )
 
-    result["numbers"] = sorted(set(numbers))
-    result["joker_numbers"] = sorted(set(jokers))
+    numbers = sorted(set(numbers))
+    jokers = sorted(set(jokers))
+    result["numbers"] = numbers
+    result["joker_numbers"] = jokers
+
+    # Attach the real evidence for exactly the numbers/jokers Claude actually chose,
+    # computed independently in Python - this is what a reviewer (or the user) checks
+    # Claude's prose against, rather than trusting Claude to have restated the figures
+    # from the payload accurately.
+    result["evidence_numbers"] = analyzer.number_evidence(numbers)
+    result["evidence_jokers"] = analyzer.joker_evidence(jokers)
+
+    # Don't trust the model's own arithmetic for these two fields - recompute them
+    # deterministically from what it actually returned, exactly as build_full_system
+    # would. This is the same math tzoker_core.build_full_system uses; duplicated
+    # here (rather than imported) to avoid a circular import with tzoker_core.
+    exact_combos = comb(len(numbers), 5)
+    exact_cost = round(exact_combos * len(jokers) * TICKET_PRICE_EUR, 2)
+    result["system_size"] = len(numbers)
+    result["estimated_cost_eur"] = exact_cost
+    result["over_budget"] = exact_cost > budget_eur
+
+    # Don't rely on the model to remember the long-shot framing - enforce it.
+    if target_category == "5+1":
+        odds = _ODDS_BY_CATEGORY.get("5+1")
+        result["caveat"] = (
+            (result.get("caveat", "") or "").rstrip(". ") + ". "
+            f"5+1 is the jackpot long shot: 1 in {odds:,} — far lower odds than "
+            f"category \"5\" (1 in {_ODDS_BY_CATEGORY['5']:,}) or \"4+1\" "
+            f"(1 in {_ODDS_BY_CATEGORY['4+1']:,})."
+        ).strip()
+
     return result, None
