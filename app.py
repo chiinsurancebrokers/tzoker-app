@@ -33,7 +33,13 @@ from tzoker_core import (
     load_all_draws,
     min_guaranteed_matches_table,
 )
-from tzoker_llm import TICKET_PRICE_EUR, ask_claude_for_pick, build_analysis_payload, get_api_key
+from tzoker_llm import (
+    TICKET_PRICE_EUR,
+    ask_claude_chat,
+    ask_claude_for_pick,
+    build_analysis_payload,
+    get_api_key,
+)
 from tzoker_openai import get_openai_api_key, review_pick_with_chatgpt
 
 st.set_page_config(page_title="Tzoker Analysis", page_icon="🎰", layout="wide")
@@ -203,6 +209,49 @@ def page_predictions(df, analyzer):
     number_badges(core5, joker=ranked_jokers[0])
 
 
+def _send_chat_message(analyzer, result, user_msg, claude_key, cross_check_rows):
+    """Send one chat turn to Claude about the current pick, and apply the result."""
+    api_history = st.session_state.get("_claude_api_history")
+    if not api_history:
+        # Shouldn't normally happen (seeded when the initial pick is made), but guard
+        # against a stale/missing session by re-seeding from what's currently shown.
+        api_history = [
+            {"role": "user", "content": json.dumps(st.session_state.get("_claude_payload", {}))},
+            {"role": "assistant", "content": json.dumps(result)},
+        ]
+
+    target_category = st.session_state.get("_claude_target_category", "5")
+    budget_eur = st.session_state.get("_claude_budget_eur", 10.0)
+
+    with st.spinner("Thinking..."):
+        new_result, updated_history, error = ask_claude_chat(
+            analyzer, st.session_state["_claude_payload"], api_history, user_msg,
+            target_category, budget_eur, claude_key, cross_check=cross_check_rows,
+        )
+
+    if error:
+        st.error(error)
+        return
+
+    display = st.session_state.setdefault("_claude_chat_display", [])
+    display.append(("user", user_msg))
+
+    reply_text = new_result.get("reply", "")
+    if new_result.get("numbers_changed"):
+        old_numbers = result.get("numbers", [])
+        old_jokers = result.get("joker_numbers", [])
+        reply_text += (
+            f"\n\n*Pick updated: numbers {old_numbers} → {new_result['numbers']}, "
+            f"joker(s) {old_jokers} → {new_result['joker_numbers']}.*"
+        )
+    display.append(("assistant", reply_text))
+
+    st.session_state["_claude_result"] = new_result
+    st.session_state["_claude_api_history"] = updated_history
+    st.session_state.pop("_chatgpt_review", None)
+    st.rerun()
+
+
 def page_ai_insights(analyzer):
     st.header("🤖 AI Insights (Claude + ChatGPT second opinion)")
     st.info(
@@ -243,10 +292,19 @@ def page_ai_insights(analyzer):
             st.error(error)
             st.session_state.pop("_claude_result", None)
         else:
+            payload = build_analysis_payload(analyzer, target_category, budget_eur)
             st.session_state["_claude_result"] = result
-            st.session_state["_claude_payload"] = build_analysis_payload(
-                analyzer, target_category, budget_eur
-            )
+            st.session_state["_claude_payload"] = payload
+            st.session_state["_claude_target_category"] = target_category
+            st.session_state["_claude_budget_eur"] = budget_eur
+            # Seed the conversation with the original payload and the CORRECTED result
+            # (not Claude's raw reply) - so any follow-up chat is grounded in the same
+            # numbers actually shown on screen, not Claude's possibly-wrong originals.
+            st.session_state["_claude_api_history"] = [
+                {"role": "user", "content": json.dumps(payload)},
+                {"role": "assistant", "content": json.dumps(result)},
+            ]
+            st.session_state["_claude_chat_display"] = []
             st.session_state.pop("_chatgpt_review", None)
 
     result = st.session_state.get("_claude_result")
@@ -282,6 +340,50 @@ def page_ai_insights(analyzer):
         st.dataframe(pd.DataFrame(result.get("evidence_numbers", [])), hide_index=True, width='stretch')
         st.write("Joker number(s):")
         st.dataframe(pd.DataFrame(result.get("evidence_jokers", [])), hide_index=True, width='stretch')
+
+    cross_check_rows = None
+    with st.expander("Cross-check against the Statistics tab (same numbers, other time windows)"):
+        st.caption(
+            "Claude's scoring uses one fixed recent window. This shows the same picked "
+            "numbers' hot/cold rank (1=hottest of 45) across the windows the Statistics "
+            "tab uses — a number that looks strong in a narrow window but ranks poorly "
+            "over 1000 draws or all-time may just be a short-run blip, not a real pattern."
+        )
+        mw = analyzer.multi_window_stats(result["numbers"])
+        cross_check_rows = []
+        for n in result["numbers"]:
+            row = {"number": n}
+            for label, pretty in [("last_100", "Last 100"), ("last_1000", "Last 1000"), ("all_time", "All-time")]:
+                stats = mw[n].get(label, {})
+                row[f"{pretty} rank"] = stats.get("rank_of_45")
+                row[f"{pretty} count"] = stats.get("count")
+            cross_check_rows.append(row)
+        st.dataframe(pd.DataFrame(cross_check_rows), hide_index=True, width='stretch')
+
+    st.divider()
+    st.subheader("💬 Discuss or revise this pick")
+    st.caption(
+        "Ask Claude about the pick, or ask it to reconsider — it can swap in a "
+        "different number, but only from the same scored candidate list, and it'll "
+        "explain any change in terms of the historical pattern, never future odds."
+    )
+
+    if st.button("Ask Claude to reconsider given the cross-check table above"):
+        _send_chat_message(
+            analyzer, result,
+            "Given the cross-check table above showing these numbers' ranks over other "
+            "time windows, should any of them be reconsidered? Suggest changes if you "
+            "think it's warranted, otherwise explain why the current pick still holds up.",
+            claude_key, cross_check_rows,
+        )
+
+    for role, text in st.session_state.get("_claude_chat_display", []):
+        with st.chat_message(role):
+            st.write(text)
+
+    user_msg = st.chat_input("Ask about this pick, or ask Claude to reconsider…")
+    if user_msg:
+        _send_chat_message(analyzer, result, user_msg, claude_key, cross_check_rows)
 
     st.divider()
     st.subheader("Second opinion (ChatGPT)")
