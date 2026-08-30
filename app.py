@@ -261,10 +261,27 @@ def page_ai_insights(analyzer):
 
     st.metric("System size", result.get("system_size", len(result["numbers"])))
     st.metric("Estimated cost", f"€{result.get('estimated_cost_eur', 0):,.2f}")
+    if result.get("over_budget"):
+        st.warning(
+            f"This system costs €{result['estimated_cost_eur']:,.2f}, over your stated "
+            f"budget. Reduce the numbers/jokers below or raise your budget above.",
+            icon="💸",
+        )
 
     st.write("**Pattern notes:**", result.get("pattern_notes", ""))
     st.write("**Rationale:**", result.get("rationale", ""))
     st.caption(result.get("caveat", ""))
+
+    with st.expander("Real evidence behind this pick (computed independently in Python)"):
+        st.caption(
+            "These are the actual historical counts for exactly the numbers above — "
+            "not Claude's restatement of them. Check Claude's pattern notes against "
+            "these figures if anything looks off."
+        )
+        st.write("Main numbers:")
+        st.dataframe(pd.DataFrame(result.get("evidence_numbers", [])), hide_index=True, width='stretch')
+        st.write("Joker number(s):")
+        st.dataframe(pd.DataFrame(result.get("evidence_jokers", [])), hide_index=True, width='stretch')
 
     st.divider()
     st.subheader("Second opinion (ChatGPT)")
@@ -301,6 +318,78 @@ def page_ai_insights(analyzer):
         else:
             st.warning(f"ChatGPT verdict: **{verdict}** — {review.get('summary', '')}")
         st.dataframe(pd.DataFrame(review.get("checks", [])), hide_index=True, width='stretch')
+
+
+def page_statistics(analyzer):
+    st.header("📐 Statistics")
+    st.caption(
+        "Descriptive statistics over your loaded draw history — the same categories "
+        "official Tzoker stats pages track (hot/cold/overdue numbers, odd/even and "
+        "low/high splits, sum, spread, by-decade, by-last-digit). These describe what "
+        "already happened; they don't change the odds of what happens next."
+    )
+
+    window = st.select_slider(
+        "Window", options=[100, 200, 500, 1000, None],
+        value=200, format_func=lambda x: "All-time" if x is None else f"Last {x} draws",
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Main numbers")
+        st.write("Hottest")
+        st.dataframe(pd.DataFrame(analyzer.hot_numbers(10, last_n_draws=window),
+                                   columns=["Number", "Times drawn"]), hide_index=True, width='stretch')
+        st.write("Coldest")
+        st.dataframe(pd.DataFrame(analyzer.cold_numbers(10, last_n_draws=window),
+                                   columns=["Number", "Times drawn"]), hide_index=True, width='stretch')
+        st.write("Most overdue (all-time gap)")
+        st.dataframe(pd.DataFrame(analyzer.overdue_numbers(10), columns=["Number", "Draws since last seen"]),
+                     hide_index=True, width='stretch')
+
+    with c2:
+        st.subheader("Joker number")
+        hot_j, cold_j = analyzer.joker_hot_cold(10)
+        st.write("Hottest")
+        st.dataframe(pd.DataFrame(hot_j, columns=["Joker", "Times drawn"]), hide_index=True, width='stretch')
+        st.write("Coldest")
+        st.dataframe(pd.DataFrame(cold_j, columns=["Joker", "Times drawn"]), hide_index=True, width='stretch')
+        st.write("Most overdue (all-time gap)")
+        st.dataframe(pd.DataFrame(analyzer.overdue_jokers(10), columns=["Joker", "Draws since last seen"]),
+                     hide_index=True, width='stretch')
+
+    st.subheader("Distribution stats")
+    dist = analyzer.distribution_stats(last_n_draws=window)
+    st.caption(f"Based on {dist['draws_analyzed']} draws.")
+
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        st.metric("Avg. sum of 5 numbers", f"{dist['sum_of_5_numbers']['mean']} ± {dist['sum_of_5_numbers']['std']}")
+        st.caption(f"Range seen: {dist['sum_of_5_numbers']['min']}–{dist['sum_of_5_numbers']['max']}")
+    with d2:
+        st.metric("Avg. spread (max−min)", f"{dist['spread_max_minus_min']['mean']} ± {dist['spread_max_minus_min']['std']}")
+    with d3:
+        st.metric("Draws analyzed", dist["draws_analyzed"])
+
+    e1, e2 = st.columns(2)
+    with e1:
+        st.write("**Odd numbers per draw (0–5)**")
+        odd_df = pd.DataFrame(sorted(dist["odd_count_distribution"].items()), columns=["Odd count", "Occurrences"])
+        st.bar_chart(odd_df.set_index("Odd count"))
+    with e2:
+        st.write("**Low numbers (≤23) per draw (0–5)**")
+        low_df = pd.DataFrame(sorted(dist["low_count_distribution_le23"].items()), columns=["Low count", "Occurrences"])
+        st.bar_chart(low_df.set_index("Low count"))
+
+    f1, f2 = st.columns(2)
+    with f1:
+        st.write("**Frequency by decade**")
+        dec_df = pd.DataFrame(list(dist["frequency_by_decade"].items()), columns=["Decade", "Times drawn"])
+        st.bar_chart(dec_df.set_index("Decade"))
+    with f2:
+        st.write("**Frequency by last digit**")
+        ld_df = pd.DataFrame(list(dist["frequency_by_last_digit"].items()), columns=["Last digit", "Times drawn"])
+        st.bar_chart(ld_df.set_index("Last digit"))
 
 
 def page_backtest(analyzer):
@@ -386,11 +475,13 @@ def main():
     st.sidebar.title("🎰 Tzoker Analysis")
     page = st.sidebar.radio(
         "Section",
-        ["Dashboard", "Predictions", "AI Insights", "Backtest", "My Submissions"],
+        ["Dashboard", "Statistics", "Predictions", "AI Insights", "Backtest", "My Submissions"],
     )
 
     if page == "Dashboard":
         page_dashboard(df, report, analyzer)
+    elif page == "Statistics":
+        page_statistics(analyzer)
     elif page == "Predictions":
         page_predictions(df, analyzer)
     elif page == "AI Insights":
