@@ -234,7 +234,58 @@ def load_all_draws(data_dir: str = ".", start_year: int = 1997, end_year: int = 
         all_draws.extend(draws)
 
     if not all_draws:
-        return pd.DataFrame(), pd.DataFrame(reports)
+        # Compatibility fallback: the repository's original loader is already proven
+        # against the historical Joker_*.xlsx layouts used by this project.  V2's
+        # stricter parser may reject an unfamiliar workbook layout; in that case, use
+        # the legacy parser rather than returning an empty app, then re-validate the
+        # resulting rows before probability analysis.
+        try:
+            from tzoker_core import load_all_draws as legacy_load_all_draws
+            legacy_df, legacy_report = legacy_load_all_draws(
+                data_dir=data_dir, start_year=start_year, end_year=end_year
+            )
+        except Exception as exc:
+            fallback_report = pd.DataFrame(reports)
+            if fallback_report.empty:
+                fallback_report = pd.DataFrame([{
+                    "year": None, "rows": 0, "loaded": 0, "skipped": 0,
+                    "invalid_duplicates": 0, "fallback_header": True,
+                    "error": f"V2 parser loaded no rows and legacy fallback failed: {exc}",
+                }])
+            else:
+                fallback_report["error"] = fallback_report.get("error", "").astype(str) + \
+                    f"; legacy fallback failed: {exc}"
+            return pd.DataFrame(), fallback_report
+
+        if legacy_df.empty:
+            return legacy_df, legacy_report
+
+        # Re-validate the legacy output so impossible draws cannot enter V2.
+        valid_mask = legacy_df["main_numbers"].apply(
+            lambda nums: (
+                isinstance(nums, (list, tuple))
+                and len(nums) == MAIN_DRAW
+                and len(set(int(n) for n in nums)) == MAIN_DRAW
+                and all(1 <= int(n) <= MAIN_POOL for n in nums)
+            )
+        ) & legacy_df["joker"].apply(lambda j: 1 <= int(j) <= JOKER_POOL)
+        invalid_count = int((~valid_mask).sum())
+        legacy_df = legacy_df.loc[valid_mask].copy()
+        legacy_df = legacy_df.sort_values(["date", "draw_id"]).reset_index(drop=True)
+
+        # Normalize the report columns expected by the V2 Data Quality page.
+        legacy_report = legacy_report.copy()
+        if "draws" in legacy_report.columns and "loaded" not in legacy_report.columns:
+            legacy_report = legacy_report.rename(columns={"draws": "loaded"})
+        if "skipped_rows" in legacy_report.columns and "skipped" not in legacy_report.columns:
+            legacy_report = legacy_report.rename(columns={"skipped_rows": "skipped"})
+        legacy_report["invalid_duplicates"] = 0
+        if len(legacy_report):
+            legacy_report.loc[legacy_report.index[-1], "invalid_duplicates"] = invalid_count
+        legacy_report["fallback_header"] = True
+        legacy_report["error"] = ""
+        legacy_report["loader"] = "legacy_compatibility_fallback"
+        return legacy_df, legacy_report
 
     df = pd.DataFrame(all_draws).sort_values(["date", "draw_id"]).reset_index(drop=True)
     before = len(df)
