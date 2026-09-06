@@ -149,6 +149,9 @@ def main():
     df, report = get_data()
     if df.empty:
         st.error("No valid Joker_<year>.xlsx data files were loaded.")
+        if not report.empty:
+            st.caption("Loader diagnostics")
+            st.dataframe(report, hide_index=True, width="stretch")
         return
     page = st.sidebar.radio("Section", ["Overview", "Historical Stats", "Probability Lab", "System Builder", "Data Quality"])
     if page == "Overview":
