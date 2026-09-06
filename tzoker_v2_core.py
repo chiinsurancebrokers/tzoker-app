@@ -515,3 +515,214 @@ def full_system(numbers: Sequence[int], jokers: Sequence[int]) -> tuple[list[tup
     combos = list(combinations(numbers, MAIN_DRAW))
     lines = len(combos) * len(jokers)
     return combos, lines, lines * TICKET_PRICE_EUR
+
+# ---------------------------------------------------------------------------
+# V2.2 — all-history signal / persistence diagnostics
+# ---------------------------------------------------------------------------
+from math import erfc, sqrt
+
+
+def _normal_two_sided_p(z: float) -> float:
+    """Two-sided standard-normal p-value without a scipy dependency."""
+    return float(erfc(abs(float(z)) / sqrt(2.0)))
+
+
+def _bernoulli_z(count: int, n_draws: int, baseline: float) -> float:
+    if n_draws <= 0:
+        return 0.0
+    se = sqrt(baseline * (1.0 - baseline) / n_draws)
+    if se <= 0:
+        return 0.0
+    return (count / n_draws - baseline) / se
+
+
+def _holm_adjust(p_values: dict[int, float]) -> dict[int, float]:
+    """Holm family-wise-error correction for the 45 simultaneous number tests."""
+    m = len(p_values)
+    ordered = sorted(p_values.items(), key=lambda kv: kv[1])
+    adjusted: dict[int, float] = {}
+    running = 0.0
+    for rank, (key, p) in enumerate(ordered):
+        value = min(1.0, (m - rank) * float(p))
+        running = max(running, value)
+        adjusted[key] = running
+    return adjusted
+
+
+def all_history_bias_report(
+    draws: pd.DataFrame,
+    tune_fraction: float = 0.60,
+    alpha_level: float = 0.05,
+) -> pd.DataFrame:
+    """Test persistence of each main number across chronological, independent eras.
+
+    The first ``tune_fraction`` of draws is the discovery/tuning era and the remainder
+    is a strictly later holdout era.  Every one of the 45 numbers is tested on holdout;
+    holdout p-values are Holm-corrected for the 45 simultaneous tests.  A number is
+    labelled validated only when its deviation has the same direction in both eras and
+    its later-era Holm-adjusted p-value is below ``alpha_level``.
+
+    This is a diagnostic for possible persistent non-uniformity, not a guarantee that a
+    future draw will preserve any historical deviation.
+    """
+    df = draws.sort_values(["date", "draw_id"]).reset_index(drop=True)
+    n = len(df)
+    if n < 100:
+        return pd.DataFrame()
+    split = int(round(n * tune_fraction))
+    split = max(50, min(split, n - 50))
+    tune = df.iloc[:split]
+    hold = df.iloc[split:]
+
+    tune_counts = Counter({i: 0 for i in range(1, MAIN_POOL + 1)})
+    hold_counts = Counter({i: 0 for i in range(1, MAIN_POOL + 1)})
+    for nums in tune["main_numbers"]:
+        tune_counts.update(int(x) for x in nums)
+    for nums in hold["main_numbers"]:
+        hold_counts.update(int(x) for x in nums)
+
+    hold_p = {}
+    interim = []
+    for number in range(1, MAIN_POOL + 1):
+        tc = tune_counts[number]
+        hc = hold_counts[number]
+        tz = _bernoulli_z(tc, len(tune), MAIN_BASELINE)
+        hz = _bernoulli_z(hc, len(hold), MAIN_BASELINE)
+        hp = _normal_two_sided_p(hz)
+        hold_p[number] = hp
+        tune_rate = tc / len(tune)
+        hold_rate = hc / len(hold)
+        tune_dev = tune_rate - MAIN_BASELINE
+        hold_dev = hold_rate - MAIN_BASELINE
+        interim.append({
+            "number": number,
+            "tune_draws": len(tune),
+            "tune_count": tc,
+            "tune_rate": tune_rate,
+            "tune_deviation_pp": 100 * tune_dev,
+            "tune_z": tz,
+            "holdout_draws": len(hold),
+            "holdout_count": hc,
+            "holdout_rate": hold_rate,
+            "holdout_deviation_pp": 100 * hold_dev,
+            "holdout_z": hz,
+            "holdout_p_raw": hp,
+            "same_direction": bool(tune_dev * hold_dev > 0),
+        })
+
+    adjusted = _holm_adjust(hold_p)
+    for row in interim:
+        q = adjusted[row["number"]]
+        row["holdout_p_holm"] = q
+        if row["same_direction"] and q < alpha_level:
+            direction = "UP" if row["holdout_deviation_pp"] > 0 else "DOWN"
+            row["status"] = f"VALIDATED {direction}"
+        elif row["same_direction"]:
+            row["status"] = "same direction, not significant"
+        else:
+            row["status"] = "not persistent"
+
+    out = pd.DataFrame(interim)
+    out["_validated"] = out["status"].str.startswith("VALIDATED")
+    out["_abs_holdout_z"] = out["holdout_z"].abs()
+    out = out.sort_values(
+        ["_validated", "same_direction", "_abs_holdout_z", "number"],
+        ascending=[False, False, False, True],
+    ).drop(columns=["_validated", "_abs_holdout_z"]).reset_index(drop=True)
+    return out
+
+
+def multi_window_number_report(
+    draws: pd.DataFrame,
+    windows: Sequence[int | None] = (100, 300, 1000, None),
+) -> pd.DataFrame:
+    """Side-by-side rates for every number across several horizons, including all-time."""
+    rows = {n: {"number": n} for n in range(1, MAIN_POOL + 1)}
+    for window in windows:
+        subset = draws.tail(window) if window else draws
+        label = "all_time" if window is None else f"last_{window}"
+        counts = Counter({n: 0 for n in range(1, MAIN_POOL + 1)})
+        for nums in subset["main_numbers"]:
+            counts.update(int(x) for x in nums)
+        n_draws = len(subset)
+        for number in range(1, MAIN_POOL + 1):
+            rate = counts[number] / n_draws if n_draws else 0.0
+            rows[number][f"{label}_rate"] = rate
+            rows[number][f"{label}_deviation_pp"] = 100 * (rate - MAIN_BASELINE)
+            rows[number][f"{label}_z"] = _bernoulli_z(counts[number], n_draws, MAIN_BASELINE)
+    result = pd.DataFrame(rows.values())
+    if "all_time_z" in result.columns:
+        result = result.assign(_abs=result["all_time_z"].abs()).sort_values(
+            ["_abs", "number"], ascending=[False, True]
+        ).drop(columns="_abs")
+    return result.reset_index(drop=True)
+
+
+def yearly_number_report(draws: pd.DataFrame, number: int) -> pd.DataFrame:
+    """Year-by-year history for one selected main number across all loaded years."""
+    if not 1 <= int(number) <= MAIN_POOL:
+        raise ValueError("number must be 1..45")
+    rows = []
+    df = draws.sort_values("date")
+    for year, grp in df.groupby(df["date"].dt.year):
+        count = int(grp["main_numbers"].apply(lambda xs: int(number) in set(xs)).sum())
+        n = len(grp)
+        rate = count / n if n else 0.0
+        z = _bernoulli_z(count, n, MAIN_BASELINE)
+        rows.append({
+            "year": int(year),
+            "draws": n,
+            "count": count,
+            "appearance_rate": rate,
+            "expected_rate": MAIN_BASELINE,
+            "deviation_pp": 100 * (rate - MAIN_BASELINE),
+            "z": z,
+        })
+    return pd.DataFrame(rows)
+
+
+def block_persistence_report(draws: pd.DataFrame, block_size: int = 250) -> pd.DataFrame:
+    """Check direction consistency in non-overlapping chronological blocks.
+
+    This is deliberately descriptive.  It helps distinguish a one-window spike from a
+    deviation that repeatedly reappears in separate eras.
+    """
+    if block_size < 50:
+        raise ValueError("block_size must be >= 50")
+    df = draws.sort_values(["date", "draw_id"]).reset_index(drop=True)
+    blocks = []
+    for start in range(0, len(df), block_size):
+        block = df.iloc[start:start + block_size]
+        if len(block) < max(50, block_size // 2):
+            continue
+        counts = Counter({n: 0 for n in range(1, MAIN_POOL + 1)})
+        for nums in block["main_numbers"]:
+            counts.update(int(x) for x in nums)
+        blocks.append((start, block, counts))
+
+    rows = []
+    for number in range(1, MAIN_POOL + 1):
+        deviations = []
+        zs = []
+        for _, block, counts in blocks:
+            rate = counts[number] / len(block)
+            deviations.append(rate - MAIN_BASELINE)
+            zs.append(_bernoulli_z(counts[number], len(block), MAIN_BASELINE))
+        positive = sum(d > 0 for d in deviations)
+        negative = sum(d < 0 for d in deviations)
+        same_side = max(positive, negative)
+        direction = "UP" if positive > negative else "DOWN" if negative > positive else "MIXED"
+        rows.append({
+            "number": number,
+            "blocks": len(blocks),
+            "blocks_above_baseline": positive,
+            "blocks_below_baseline": negative,
+            "dominant_direction": direction,
+            "direction_consistency": same_side / len(blocks) if blocks else 0.0,
+            "mean_deviation_pp": 100 * float(np.mean(deviations)) if deviations else 0.0,
+            "max_abs_block_z": max((abs(z) for z in zs), default=0.0),
+        })
+    return pd.DataFrame(rows).sort_values(
+        ["direction_consistency", "max_abs_block_z", "number"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
