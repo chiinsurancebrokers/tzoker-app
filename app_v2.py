@@ -7,6 +7,8 @@ import streamlit as st
 
 from tzoker_v2_core import (
     HistoricalAnalyzer,
+    all_history_bias_report,
+    block_persistence_report,
     MAIN_BASELINE,
     JOKER_BASELINE,
     calibrated_frequency_report,
@@ -14,6 +16,8 @@ from tzoker_v2_core import (
     load_all_draws,
     prize_categories,
     top_probability_jokers,
+    multi_window_number_report,
+    yearly_number_report,
     top_probability_numbers,
 )
 
@@ -107,6 +111,134 @@ def page_probability_lab(df):
     st.dataframe(prob_df, hide_index=True, width="stretch")
 
 
+
+@st.cache_data(show_spinner=False)
+def get_signal_tables(df, tune_fraction, block_size):
+    return (
+        all_history_bias_report(df, tune_fraction=tune_fraction),
+        multi_window_number_report(df),
+        block_persistence_report(df, block_size=block_size),
+    )
+
+
+def page_signal_lab(df):
+    st.header("🔬 Signal Lab — all years")
+    first_date = df["date"].min().date()
+    last_date = df["date"].max().date()
+    st.info(
+        f"This page uses the complete loaded history ({first_date} to {last_date}, "
+        f"{len(df):,} draws). It asks whether any number's deviation from 5/45 persists "
+        "across independent time periods. It does not assume that a historically high "
+        "frequency will continue."
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        tune_fraction = st.slider(
+            "Discovery share of history", 0.50, 0.80, 0.60, 0.05,
+            help="The first part of the chronology is used to identify the direction of a deviation. The rest is untouched holdout."
+        )
+    with c2:
+        block_size = st.select_slider(
+            "Non-overlapping block size", options=[100, 150, 200, 250, 300, 500], value=250,
+            help="A separate descriptive persistence check across non-overlapping chronological blocks."
+        )
+
+    persistence, windows, blocks = get_signal_tables(df, tune_fraction, block_size)
+
+    st.subheader("1. Independent-era persistence test")
+    st.caption(
+        "The first chronological era determines whether a number was above or below the fair baseline. "
+        "The later era checks whether the same direction survives. Holdout p-values are Holm-adjusted "
+        "because 45 numbers are tested at the same time."
+    )
+    if persistence.empty:
+        st.warning("Not enough draws for the persistence test.")
+    else:
+        validated = persistence[persistence["status"].str.startswith("VALIDATED")]
+        same_not_sig = persistence[persistence["status"] == "same direction, not significant"]
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Numbers tested", len(persistence))
+        m2.metric("Same direction in both eras", len(validated) + len(same_not_sig))
+        m3.metric("Validated after 45-test correction", len(validated))
+        if validated.empty:
+            st.warning(
+                "No main number shows a statistically validated persistent deviation across the two independent eras after correcting for 45 simultaneous tests."
+            )
+        else:
+            st.success(
+                f"{len(validated)} number(s) survived the later holdout and the 45-number multiple-testing correction. "
+                "Treat this as an anomaly to investigate, not as a guaranteed future edge."
+            )
+
+        show = persistence.copy()
+        for col in ["tune_rate", "holdout_rate"]:
+            show[col] = (100 * show[col]).round(3)
+        for col in ["tune_deviation_pp", "holdout_deviation_pp", "tune_z", "holdout_z"]:
+            show[col] = show[col].round(3)
+        show["holdout_p_holm"] = show["holdout_p_holm"].map(lambda x: f"{x:.4g}")
+        show = show.rename(columns={
+            "tune_rate": "discovery_rate_%",
+            "holdout_rate": "holdout_rate_%",
+            "holdout_p_holm": "holdout_Holm_p",
+        })
+        st.dataframe(
+            show[[
+                "number", "discovery_rate_%", "tune_deviation_pp", "tune_z",
+                "holdout_rate_%", "holdout_deviation_pp", "holdout_z",
+                "same_direction", "holdout_Holm_p", "status"
+            ]],
+            hide_index=True, width="stretch"
+        )
+
+    st.subheader("2. Multi-window comparison")
+    st.caption(
+        "Every number is compared over the last 100, 300 and 1,000 draws and across the complete history. "
+        "This makes a one-window spike easy to distinguish from a longer-lived pattern."
+    )
+    win = windows.copy()
+    for col in [c for c in win.columns if c.endswith("_rate")]:
+        win[col] = (100 * win[col]).round(3)
+    for col in [c for c in win.columns if c.endswith("_deviation_pp") or c.endswith("_z")]:
+        win[col] = win[col].round(3)
+    st.dataframe(win, hide_index=True, width="stretch")
+
+    st.subheader("3. Non-overlapping block persistence")
+    st.caption(
+        f"The full history is cut into separate {block_size}-draw blocks. A number that is high only in one block "
+        "is very different from one that stays on the same side of the baseline across many independent blocks."
+    )
+    block_show = blocks.copy()
+    block_show["direction_consistency"] = (100 * block_show["direction_consistency"]).round(1)
+    block_show["mean_deviation_pp"] = block_show["mean_deviation_pp"].round(3)
+    block_show["max_abs_block_z"] = block_show["max_abs_block_z"].round(2)
+    st.dataframe(block_show, hide_index=True, width="stretch")
+
+    st.subheader("4. Inspect one number across every year")
+    default_number = 29 if 29 in range(1, 46) else 1
+    selected = st.selectbox("Main number", list(range(1, 46)), index=default_number - 1)
+    yearly = yearly_number_report(df, selected)
+    if not yearly.empty:
+        overall_count = int(df["main_numbers"].apply(lambda xs: selected in set(xs)).sum())
+        overall_rate = overall_count / len(df)
+        a, b, c = st.columns(3)
+        a.metric("All-time appearances", overall_count)
+        b.metric("All-time appearance rate", f"{overall_rate:.3%}")
+        c.metric("Fair baseline", f"{MAIN_BASELINE:.3%}")
+        yearly_show = yearly.copy()
+        yearly_show["appearance_rate"] = (100 * yearly_show["appearance_rate"]).round(2)
+        yearly_show["expected_rate"] = (100 * yearly_show["expected_rate"]).round(2)
+        yearly_show["deviation_pp"] = yearly_show["deviation_pp"].round(2)
+        yearly_show["z"] = yearly_show["z"].round(2)
+        st.dataframe(yearly_show, hide_index=True, width="stretch")
+        chart = yearly.set_index("year")[["appearance_rate", "expected_rate"]]
+        st.line_chart(chart)
+
+    st.caption(
+        "Interpretation rule: a number is not promoted into the prediction engine merely because it looks high historically. "
+        "A future V2.x model may use a signal only after it survives independent holdout testing and the multiple-testing guard."
+    )
+
 def page_system_builder(df):
     st.header("🧮 System Builder")
     st.info(
@@ -153,13 +285,15 @@ def main():
             st.caption("Loader diagnostics")
             st.dataframe(report, hide_index=True, width="stretch")
         return
-    page = st.sidebar.radio("Section", ["Overview", "Historical Stats", "Probability Lab", "System Builder", "Data Quality"])
+    page = st.sidebar.radio("Section", ["Overview", "Historical Stats", "Probability Lab", "Signal Lab", "System Builder", "Data Quality"])
     if page == "Overview":
         page_overview(df, report)
     elif page == "Historical Stats":
         page_history(df)
     elif page == "Probability Lab":
         page_probability_lab(df)
+    elif page == "Signal Lab":
+        page_signal_lab(df)
     elif page == "System Builder":
         page_system_builder(df)
     else:
