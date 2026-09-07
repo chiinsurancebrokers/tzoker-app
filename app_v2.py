@@ -9,6 +9,10 @@ from tzoker_v2_core import (
     HistoricalAnalyzer,
     all_history_bias_report,
     block_persistence_report,
+    block_detail_report,
+    DEFAULT_YEAR_ERAS,
+    era_number_report,
+    multi_era_persistence_report,
     MAIN_BASELINE,
     JOKER_BASELINE,
     calibrated_frequency_report,
@@ -21,7 +25,7 @@ from tzoker_v2_core import (
     top_probability_numbers,
 )
 
-st.set_page_config(page_title="Tzoker Analysis V2", page_icon="🎰", layout="wide")
+st.set_page_config(page_title="Tzoker Analysis V2.3", page_icon="🎰", layout="wide")
 
 
 @st.cache_data(show_spinner=False)
@@ -49,7 +53,7 @@ def odds_table():
 
 
 def page_overview(df, report):
-    st.header("🎰 Tzoker Analysis V2")
+    st.header("🎰 Tzoker Analysis V2.3")
     st.info(
         "V2 separates historical patterns from future probabilities. A historical-frequency "
         "model is allowed to influence the displayed probabilities only if it beats the exact "
@@ -118,18 +122,20 @@ def get_signal_tables(df, tune_fraction, block_size):
         all_history_bias_report(df, tune_fraction=tune_fraction),
         multi_window_number_report(df),
         block_persistence_report(df, block_size=block_size),
+        multi_era_persistence_report(df),
+        era_number_report(df),
     )
 
 
 def page_signal_lab(df):
-    st.header("🔬 Signal Lab — all years")
+    st.header("🔬 Signal Lab — all years + independent eras")
     first_date = df["date"].min().date()
     last_date = df["date"].max().date()
     st.info(
         f"This page uses the complete loaded history ({first_date} to {last_date}, "
-        f"{len(df):,} draws). It asks whether any number's deviation from 5/45 persists "
-        "across independent time periods. It does not assume that a historically high "
-        "frequency will continue."
+        f"{len(df):,} draws). V2.3 adds two genuinely non-overlapping replication checks: "
+        "fixed calendar eras and sequential draw blocks. Historical persistence is treated "
+        "as an anomaly to investigate, not as proof that the next draw is predictable."
     )
 
     c1, c2 = st.columns(2)
@@ -140,13 +146,13 @@ def page_signal_lab(df):
         )
     with c2:
         block_size = st.select_slider(
-            "Non-overlapping block size", options=[100, 150, 200, 250, 300, 500], value=250,
-            help="A separate descriptive persistence check across non-overlapping chronological blocks."
+            "Non-overlapping block size", options=[100, 150, 200, 250, 300, 500], value=500,
+            help="Separate chronological blocks; 500 is the default because it reduces short-window noise."
         )
 
-    persistence, windows, blocks = get_signal_tables(df, tune_fraction, block_size)
+    persistence, windows, blocks, era_summary, era_long = get_signal_tables(df, tune_fraction, block_size)
 
-    st.subheader("1. Independent-era persistence test")
+    st.subheader("1. Independent discovery → holdout test")
     st.caption(
         "The first chronological era determines whether a number was above or below the fair baseline. "
         "The later era checks whether the same direction survives. Holdout p-values are Holm-adjusted "
@@ -193,8 +199,8 @@ def page_signal_lab(df):
 
     st.subheader("2. Multi-window comparison")
     st.caption(
-        "Every number is compared over the last 100, 300 and 1,000 draws and across the complete history. "
-        "This makes a one-window spike easy to distinguish from a longer-lived pattern."
+        "Last 100, 300 and 1,000 draws are useful diagnostics, but they overlap. "
+        "They should not be counted as independent confirmations."
     )
     win = windows.copy()
     for col in [c for c in win.columns if c.endswith("_rate")]:
@@ -203,10 +209,91 @@ def page_signal_lab(df):
         win[col] = win[col].round(3)
     st.dataframe(win, hide_index=True, width="stretch")
 
-    st.subheader("3. Non-overlapping block persistence")
+    st.subheader("3. Multi-Era Persistence Test — fixed non-overlapping eras")
+    era_labels = ", ".join(f"{a}–{b}" for a, b in DEFAULT_YEAR_ERAS)
     st.caption(
-        f"The full history is cut into separate {block_size}-draw blocks. A number that is high only in one block "
-        "is very different from one that stays on the same side of the baseline across many independent blocks."
+        f"The history is divided into five non-overlapping calendar eras: {era_labels}. "
+        "For each number we count how many eras are above/below the fair 11.111% baseline. "
+        "A candidate label requires ≥80% direction consistency, a Holm-significant pooled deviation, "
+        "and no strongly significant reversal in an individual era."
+    )
+    if era_summary.empty:
+        st.warning("No era data available.")
+    else:
+        cand = era_summary[era_summary["status"].str.startswith("PERSISTENT")]
+        e1, e2, e3 = st.columns(3)
+        e1.metric("Fixed eras", era_summary["eras"].max())
+        e2.metric("≥80% same direction", int((era_summary["direction_consistency"] >= 0.80).sum()))
+        e3.metric("Persistent candidates", len(cand))
+        if cand.empty:
+            st.warning(
+                "No number currently satisfies the stricter multi-era candidate rule. "
+                "This is evidence against a stable long-lived bias, not proof that every finite-period fluctuation is zero."
+            )
+        else:
+            st.success(
+                f"{len(cand)} number(s) satisfy the multi-era candidate rule. Inspect their era-by-era rows before drawing any conclusion."
+            )
+
+        es = era_summary.copy()
+        es["direction_consistency"] = (100 * es["direction_consistency"]).round(1)
+        es["pooled_rate"] = (100 * es["pooled_rate"]).round(3)
+        for col in ["mean_deviation_pp", "median_deviation_pp", "pooled_deviation_pp", "pooled_z"]:
+            es[col] = es[col].round(3)
+        es["sign_test_p"] = es["sign_test_p"].map(lambda x: f"{x:.4g}")
+        es["pooled_p_holm"] = es["pooled_p_holm"].map(lambda x: f"{x:.4g}")
+        st.dataframe(
+            es[[
+                "number", "eras_above_baseline", "eras_below_baseline", "dominant_direction",
+                "direction_consistency", "mean_deviation_pp", "pooled_rate",
+                "pooled_z", "sign_test_p", "pooled_p_holm", "strong_reversal", "status"
+            ]].rename(columns={
+                "direction_consistency": "direction_consistency_%",
+                "pooled_rate": "pooled_rate_%",
+                "pooled_p_holm": "pooled_Holm_p",
+            }),
+            hide_index=True, width="stretch"
+        )
+
+    st.subheader("4. Inspect one number across independent eras and sequential blocks")
+    selected = st.selectbox("Main number to inspect", list(range(1, 46)), index=42)  # 43
+
+    if not era_long.empty:
+        one_era = era_long[era_long["number"] == selected].copy()
+        if not one_era.empty:
+            one_era["appearance_rate"] = (100 * one_era["appearance_rate"]).round(3)
+            one_era["expected_rate"] = (100 * one_era["expected_rate"]).round(3)
+            one_era["deviation_pp"] = one_era["deviation_pp"].round(3)
+            one_era["z"] = one_era["z"].round(3)
+            st.write("**Fixed calendar eras**")
+            st.dataframe(
+                one_era[["era", "draws", "count", "appearance_rate", "deviation_pp", "z", "direction"]]
+                .rename(columns={"appearance_rate": "appearance_rate_%"}),
+                hide_index=True, width="stretch"
+            )
+
+    detail = block_detail_report(df, selected, block_size=block_size)
+    if not detail.empty:
+        bd = detail.copy()
+        bd["appearance_rate"] = (100 * bd["appearance_rate"]).round(3)
+        bd["expected_rate"] = (100 * bd["expected_rate"]).round(3)
+        bd["deviation_pp"] = bd["deviation_pp"].round(3)
+        bd["z"] = bd["z"].round(3)
+        bd["start_date"] = bd["start_date"].dt.date
+        bd["end_date"] = bd["end_date"].dt.date
+        st.write(f"**Separate {block_size}-draw blocks**")
+        st.dataframe(
+            bd[["block", "start_date", "end_date", "draws", "count", "appearance_rate", "deviation_pp", "z", "direction"]]
+            .rename(columns={"appearance_rate": "appearance_rate_%"}),
+            hide_index=True, width="stretch"
+        )
+        block_chart = detail.set_index("block")[["appearance_rate", "expected_rate"]]
+        st.line_chart(block_chart)
+
+    st.subheader("5. All-number non-overlapping block summary")
+    st.caption(
+        f"The complete chronology is split into separate {block_size}-draw blocks. "
+        "This table ranks direction consistency across those blocks; it is descriptive and does not replace the holdout test."
     )
     block_show = blocks.copy()
     block_show["direction_consistency"] = (100 * block_show["direction_consistency"]).round(1)
@@ -214,9 +301,7 @@ def page_signal_lab(df):
     block_show["max_abs_block_z"] = block_show["max_abs_block_z"].round(2)
     st.dataframe(block_show, hide_index=True, width="stretch")
 
-    st.subheader("4. Inspect one number across every year")
-    default_number = 29 if 29 in range(1, 46) else 1
-    selected = st.selectbox("Main number", list(range(1, 46)), index=default_number - 1)
+    st.subheader("6. Inspect the selected number year by year")
     yearly = yearly_number_report(df, selected)
     if not yearly.empty:
         overall_count = int(df["main_numbers"].apply(lambda xs: selected in set(xs)).sum())
@@ -235,8 +320,9 @@ def page_signal_lab(df):
         st.line_chart(chart)
 
     st.caption(
-        "Interpretation rule: a number is not promoted into the prediction engine merely because it looks high historically. "
-        "A future V2.x model may use a signal only after it survives independent holdout testing and the multiple-testing guard."
+        "Interpretation rule: overlapping windows are clues only. The strongest evidence comes from "
+        "replication in non-overlapping eras/blocks plus an untouched holdout. No historical signal is "
+        "automatically promoted into a future probability."
     )
 
 def page_system_builder(df):
