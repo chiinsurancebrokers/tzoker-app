@@ -726,3 +726,196 @@ def block_persistence_report(draws: pd.DataFrame, block_size: int = 250) -> pd.D
         ["direction_consistency", "max_abs_block_z", "number"],
         ascending=[False, False, True],
     ).reset_index(drop=True)
+
+# ---------------------------------------------------------------------------
+# V2.3 — fixed-era and non-overlapping replication diagnostics
+# ---------------------------------------------------------------------------
+DEFAULT_YEAR_ERAS = (
+    (1997, 2002),
+    (2003, 2008),
+    (2009, 2014),
+    (2015, 2020),
+    (2021, 2026),
+)
+
+
+def _two_sided_sign_p(successes: int, trials: int) -> float:
+    """Exact two-sided sign-test p-value under P(up)=P(down)=0.5."""
+    if trials <= 0:
+        return 1.0
+    successes = max(successes, trials - successes)
+    tail = sum(comb(trials, k) for k in range(successes, trials + 1)) / (2 ** trials)
+    return min(1.0, 2.0 * tail)
+
+
+def era_number_report(
+    draws: pd.DataFrame,
+    eras: Sequence[tuple[int, int]] = DEFAULT_YEAR_ERAS,
+) -> pd.DataFrame:
+    """Long-format per-number statistics for fixed, non-overlapping calendar eras."""
+    if draws.empty:
+        return pd.DataFrame()
+    df = draws.sort_values(["date", "draw_id"]).copy()
+    rows: list[dict] = []
+    for era_index, (start_year, end_year) in enumerate(eras, start=1):
+        era = df[(df["date"].dt.year >= start_year) & (df["date"].dt.year <= end_year)]
+        if era.empty:
+            continue
+        counts = Counter({n: 0 for n in range(1, MAIN_POOL + 1)})
+        for nums in era["main_numbers"]:
+            counts.update(int(x) for x in nums)
+        n_draws = len(era)
+        for number in range(1, MAIN_POOL + 1):
+            count = counts[number]
+            rate = count / n_draws
+            dev = rate - MAIN_BASELINE
+            rows.append({
+                "number": number,
+                "era_index": era_index,
+                "era": f"{start_year}-{end_year}",
+                "start_year": start_year,
+                "end_year": end_year,
+                "start_date": era["date"].min(),
+                "end_date": era["date"].max(),
+                "draws": n_draws,
+                "count": count,
+                "appearance_rate": rate,
+                "expected_rate": MAIN_BASELINE,
+                "deviation_pp": 100 * dev,
+                "z": _bernoulli_z(count, n_draws, MAIN_BASELINE),
+                "direction": "UP" if dev > 0 else "DOWN" if dev < 0 else "AT BASELINE",
+            })
+    return pd.DataFrame(rows)
+
+
+def multi_era_persistence_report(
+    draws: pd.DataFrame,
+    eras: Sequence[tuple[int, int]] = DEFAULT_YEAR_ERAS,
+    consistency_threshold: float = 0.80,
+    alpha_level: float = 0.05,
+) -> pd.DataFrame:
+    """Summarize whether deviations replicate across fixed non-overlapping eras.
+
+    The sign test asks only whether the same side of the baseline repeats across eras.
+    ``pooled_p_holm`` tests the overall deviation after correcting across all 45 numbers.
+    A PERSISTENT CANDIDATE label requires both >=80% directional consistency and a
+    Holm-significant pooled deviation, with no strong (|z|>=1.96) reversal in an era.
+
+    This is still a historical anomaly diagnostic, not a future-probability claim.
+    """
+    long = era_number_report(draws, eras=eras)
+    if long.empty:
+        return pd.DataFrame()
+
+    interim: list[dict] = []
+    pooled_p: dict[int, float] = {}
+    for number, grp in long.groupby("number", sort=True):
+        grp = grp.sort_values("era_index")
+        devs = grp["deviation_pp"].to_numpy(dtype=float)
+        zs = grp["z"].to_numpy(dtype=float)
+        draws_n = grp["draws"].to_numpy(dtype=int)
+        counts_n = grp["count"].to_numpy(dtype=int)
+        up = int(np.sum(devs > 0))
+        down = int(np.sum(devs < 0))
+        non_ties = up + down
+        same_side = max(up, down)
+        dominant = "UP" if up > down else "DOWN" if down > up else "MIXED"
+        consistency = same_side / non_ties if non_ties else 0.0
+        sign_p = _two_sided_sign_p(same_side, non_ties) if non_ties else 1.0
+
+        pooled_draws = int(draws_n.sum())
+        pooled_count = int(counts_n.sum())
+        pooled_rate = pooled_count / pooled_draws if pooled_draws else 0.0
+        pooled_z = _bernoulli_z(pooled_count, pooled_draws, MAIN_BASELINE)
+        p_raw = _normal_two_sided_p(pooled_z)
+        pooled_p[int(number)] = p_raw
+
+        if dominant == "UP":
+            strong_reversal = bool(np.any(zs <= -1.96))
+        elif dominant == "DOWN":
+            strong_reversal = bool(np.any(zs >= 1.96))
+        else:
+            strong_reversal = False
+
+        interim.append({
+            "number": int(number),
+            "eras": len(grp),
+            "eras_above_baseline": up,
+            "eras_below_baseline": down,
+            "dominant_direction": dominant,
+            "direction_consistency": consistency,
+            "sign_test_p": sign_p,
+            "mean_deviation_pp": float(np.mean(devs)),
+            "median_deviation_pp": float(np.median(devs)),
+            "min_era_deviation_pp": float(np.min(devs)),
+            "max_era_deviation_pp": float(np.max(devs)),
+            "pooled_rate": pooled_rate,
+            "pooled_deviation_pp": 100 * (pooled_rate - MAIN_BASELINE),
+            "pooled_z": pooled_z,
+            "pooled_p_raw": p_raw,
+            "strong_reversal": strong_reversal,
+        })
+
+    adjusted = _holm_adjust(pooled_p)
+    for row in interim:
+        q = adjusted[row["number"]]
+        row["pooled_p_holm"] = q
+        if (
+            row["dominant_direction"] in {"UP", "DOWN"}
+            and row["direction_consistency"] >= consistency_threshold
+            and q < alpha_level
+            and not row["strong_reversal"]
+        ):
+            row["status"] = f"PERSISTENT {row['dominant_direction']} CANDIDATE"
+        elif row["direction_consistency"] >= consistency_threshold:
+            row["status"] = f"consistent {row['dominant_direction'].lower()}, not validated"
+        else:
+            row["status"] = "mixed across eras"
+
+    out = pd.DataFrame(interim)
+    out["_candidate"] = out["status"].str.startswith("PERSISTENT")
+    out = out.sort_values(
+        ["_candidate", "direction_consistency", "pooled_p_holm", "number"],
+        ascending=[False, False, True, True],
+    ).drop(columns="_candidate").reset_index(drop=True)
+    return out
+
+
+def block_detail_report(
+    draws: pd.DataFrame,
+    number: int,
+    block_size: int = 500,
+) -> pd.DataFrame:
+    """Detailed statistics for one number in separate sequential draw blocks."""
+    number = int(number)
+    if not 1 <= number <= MAIN_POOL:
+        raise ValueError("number must be 1..45")
+    if block_size < 50:
+        raise ValueError("block_size must be >= 50")
+
+    df = draws.sort_values(["date", "draw_id"]).reset_index(drop=True)
+    rows: list[dict] = []
+    block_no = 0
+    for start in range(0, len(df), block_size):
+        block = df.iloc[start:start + block_size]
+        if len(block) < max(50, block_size // 2):
+            continue
+        block_no += 1
+        count = int(block["main_numbers"].apply(lambda xs: number in set(xs)).sum())
+        rate = count / len(block)
+        dev = rate - MAIN_BASELINE
+        rows.append({
+            "block": block_no,
+            "draw_index_start": start + 1,
+            "draw_index_end": start + len(block),
+            "start_date": block["date"].min(),
+            "end_date": block["date"].max(),
+            "draws": len(block),
+            "count": count,
+            "appearance_rate": rate,
+            "expected_rate": MAIN_BASELINE,
+            "deviation_pp": 100 * dev,
+            "z": _bernoulli_z(count, len(block), MAIN_BASELINE),
+            "direction": "UP" if dev > 0 else "DOWN" if dev < 0 else "AT BASELINE",
+        })
+    return pd.DataFrame(rows)
